@@ -1,7 +1,7 @@
-import { describe } from "./internal/Describe";
+import { describe, test, it, afterAll, afterEach, beforeAll, beforeEach, todo } from "./internal/test/describe";
 import { expect, Expectation } from "./internal/Expectation";
-import { test, it, afterAll, afterEach, beforeAll, beforeEach, todo } from "./internal/Test";
-import { log } from "./internal/log";
+
+import { log } from "./internal/test/log";
 import {
   performanceEnabled,
   maxSamples,
