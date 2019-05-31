@@ -1,302 +1,411 @@
-import { ASUtil } from "assemblyscript/lib/loader";
-import { TestGroup } from "./TestGroup";
-import { TestReporter } from "./TestReporter";
-import { TestResult } from "./TestResult";
-import { DefaultTestReporter } from "../reporter/DefaultTestReporter";
-import { performance } from "perf_hooks";
-import { timeDifference } from "../util/timeDifference";
-import { IAspectExports } from "../util/IAspectExports";
-import { TestCollector, ITestCollectorParameters } from "./TestCollector";
+import { IPerformanceConfiguration } from "../util/IPerformanceConfiguration";
 import { IWritable } from "../reporter/IWriteable";
+import { TestReporter } from "./TestReporter";
+import { EmptyReporter } from "../reporter/EmptyReporter";
+import { ASUtil } from "assemblyscript/lib/loader";
+import { IAspectExports } from "../util/IAspectExports";
+import { ActualValue } from "../util/ActualValue";
+import { ILogTarget } from "../util/ILogTarget";
+import { LogValue } from "../util/LogValue";
 
-export interface ITestContextParameters extends ITestCollectorParameters {
+const wasmFilter = (input: string): boolean => /wasm-function/i.test(input);
+
+export interface ITestContextParameters {
   reporter?: TestReporter;
   stdout?: IWritable;
   stderr?: IWritable;
+  performanceConfiguration?: IPerformanceConfiguration;
+  testRegex?: RegExp;
+  groupRegex?: RegExp;
+  fileName?: string;
 }
 
-export class TestContext extends TestCollector {
-
-  public time: number = 0;
-  public pass: boolean = true;
-  public startupTime: number = 0;
-  public reporter: TestReporter = new DefaultTestReporter();
-
+export class TestContext {
+  private reporter: TestReporter = new EmptyReporter();
   /* istanbul ignore next */
   public stdout: IWritable | null = process ? process.stdout : null;
   /* istanbul ignore next */
   public stderr: IWritable | null = process.stderr ? process.stderr : null;
+  private performanceConfiguration: IPerformanceConfiguration = {};
+  public testRegex: RegExp = new RegExp("");
+  public groupRegex: RegExp = new RegExp("");
+  public fileName: string = "";
 
-  private endGroup: boolean = false;
+  public wasm: (ASUtil & IAspectExports) | null = null;
+
+  private actual: ActualValue | null = null;
+  private expected: ActualValue | null = null;
+  private logTarget: ILogTarget = {
+    logs: [],
+    stack: "",
+    message: "",
+  };
 
   constructor(props?: ITestContextParameters) {
-    super(props);
-
     if (props) {
-      /* istanbul ignore next */
       if (props.reporter) this.reporter = props.reporter;
-      /* istanbul ignore next */
       if (props.stdout) this.stdout = props.stdout;
-      /* istanbul ignore next */
       if (props.stderr) this.stderr = props.stderr;
-
+      if (props.performanceConfiguration) this.performanceConfiguration = props.performanceConfiguration;
+      if (props.testRegex) this.testRegex = props.testRegex;
+      if (props.groupRegex) this.groupRegex = props.groupRegex;
+      if (props.fileName) this.fileName = props.fileName;
     }
   }
 
   /**
-   * Run the tests on the wasm module.
-   */
-  public run(wasm: ASUtil & IAspectExports): void {
-    // set wasm immediately
-    this.wasm = wasm;
-
-    // start the timer
-    const start = performance.now();
-
-    // start the module up
-    super.collectTests();
-
-    // calculate startuptime
-    this.startupTime = timeDifference(performance.now(), start);
-
-    if (this.errors.length > 0) return;
-    this.ready = true;
-
-    // start the test suite
-    this.reporter.onStart(this);
-
-    for (const group of this.testGroups) {
-      this.runGroup(group);
-    }
-
-    const end = performance.now();
-    this.time = timeDifference(end, start);
-
-    this.reporter.onFinish(this);
-  }
-
-  private runGroup(group: TestGroup): void {
-    this.endGroup = false;
-
-    // set the group starttime
-    group.start = performance.now();
-
-    // set the log target
-    this.logTarget = group;
-
-    // for each beforeAllCallback
-    this.runBeforeAll(group);
-
-    // report the group as started, and log all the beforeAll logs outside the describe block
-    this.reporter.onGroupStart(group);
-
-    if (this.endGroup) return;
-
-    for (const result of group.tests) {
-      this.runTest(group, result);
-      if (this.endGroup) return;
-      this.reporter.onTestFinish(group, result);
-      this.logTarget = group;
-    }
-
-    // for each afterAllCallback
-    this.runAfterAll(group);
-    if (this.endGroup) return;
-
-    // finish the group
-    group.end = performance.now();
-    group.time = timeDifference(group.end, group.start);
-    group.reason = `Test suite ${group.name} passed successfully.`;
-    this.reporter.onGroupFinish(group);
-  }
-
-  /**
-   * Run a given test.
+   * This method creates a WebAssembly imports object with all the TestContext functions
+   * bound to the TestContext.
    *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current run group.
-   * @param {number} testIndex - The current test index.
+   * @param {any[]} imports - Every import item specified.
    */
-  private runTest(group: TestGroup, result: TestResult): void {
-    // set the log target
-    this.logTarget = result;
-
-    this.reporter.onTestStart(group, result);
-    result.ran = true;
-    result.start = performance.now();
-    // If performance is enabled, use the performance values, otherwise, just run once.
-    if (result.performance) {
-      let runCount = 0;
-
-      const testStartTime = performance.now();
-      let currentTestRunTime = 0;
-      // run the test loop
-      while (true) { // always run at least once
-        this.runBeforeEach(group, result);
-        /**
-         * Especially because the performance functions are run repeatedly, if an error occurs, assume the
-         * worst and skip the test group. These functions definitely are assumed to be safe by the test context.
-         */
-        if (this.endGroup) return;
-        this.runTestCall(group, result);
-        this.runAfterEach(group, result);
-        if (this.endGroup) return; // check to see if the afterEach functions errored (see above)
-
-        currentTestRunTime = performance.now() - testStartTime; // calculate how long the current test has run
-
-        runCount += 1;  // increase the run count
-
-        if (runCount >= result.maxSamples) break; // if we have reached the max sample count
-        if (currentTestRunTime >= result.maxRuntime) break; // weve collected enough samples and the test is over
-      }
-
-      if (result.calculateAverageValue) result.calculateAverage();
-      if (result.calculateMaxValue) result.calculateMax();
-      if (result.calculateMedianValue) result.calculateMedian();
-      if (result.calculateMinValue) result.calculateMin();
-      if (result.calculateVarianceValue) result.calculateVariance();
-      if (result.calculateStandardDeviationValue) result.calculateStandardDeviation();
-    } else {
-      this.runBeforeEach(group, result);
-      if (this.endGroup) return;
-      this.runTestCall(group, result);
-      this.runAfterEach(group, result);
-      if (this.endGroup) return;
-    }
-
-    result.end = performance.now();
-    result.runTime = timeDifference(result.end, result.start);
+  public createImports(...imports: any[]): any {
+    const result = Object.assign({}, ...imports, {
+      __aspect: {
+        clearExpected: this.clearExpected.bind(this),
+        debug: this.debug.bind(this),
+        tryCall: this.tryCall.bind(this),
+        logNull: this.logNull.bind(this),
+        logReference: this.logReference.bind(this),
+        logString: this.logString.bind(this),
+        logValue: this.logValue.bind(this),
+        reportActualNull: this.reportActualNull.bind(this),
+        reportExpectedNull: this.reportExpectedNull.bind(this),
+        reportActualValue: this.reportActualValue.bind(this),
+        reportExpectedValue: this.reportExpectedValue.bind(this),
+        reportActualReference: this.reportActualReference.bind(this),
+        reportExpectedReference: this.reportExpectedReference.bind(this),
+        reportActualString: this.reportActualString.bind(this),
+        reportExpectedString: this.reportExpectedString.bind(this),
+        reportExpectedTruthy: this.reportExpectedTruthy.bind(this),
+        reportExpectedFalsy: this.reportExpectedFalsy.bind(this),
+        reportExpectedFinite: this.reportExpectedFinite.bind(this),
+      },
+    });
+    result.env = result.env || {};
+    const previousAbort = (result.env.abort) || (() => {});
+    result.env.abort = (...args: any[]) => {
+      previousAbort(...args);
+      // @ts-ignore
+      this.abort(...args);
+    };
+    return result;
   }
 
   /**
-   * Run the current test once and collect statistics.
-   *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current test group.
-   * @param {TestResult} result - The current test result.
-   * @param {number} testIndex - The current test index.
+   * This function reports an actual null value.
    */
-  private runTestCall(group: TestGroup, result: TestResult): void {
-
-    const start = performance.now();
-    const testCallResult = this.tryCall(result.functionPointer);
-
-    const end = performance.now();
-
-    result.times.push(timeDifference(end, start));
-    result.pass = result.negated
-      ? (testCallResult === 0)
-      : (testCallResult === 1);
-
-    if (!result.pass) {
-      group.pass = false;
-      // if it's not negated then set the message, the actual, expected, and stack values
-      if (!result.negated) {
-        result.message = this.message;
-        result.actual = this.actual;
-        result.expected = this.expected;
-        result.stack = this.stack;
-      }
-    }
+  private reportActualNull(): void {
+    const value = new ActualValue();
+    value.message = `null`;
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.value = null;
+    this.actual = value;
   }
 
   /**
-   * Run the afterEach callbacks before running the test.
+   * This function reports an expected null value.
    *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current test group.
-   * @param {TestResult} result - The current test result.
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
    */
-  private runAfterEach(group: TestGroup, result: TestResult): void {
-    // for each afterEach callback function pointer
-    for (const afterEachCallback of group.afterEachPointers) {
-      const afterEachResult = this.tryCall(afterEachCallback);
-      // if afterEach fails
-      if (afterEachResult === 0) {
-        this.endGroup = true;
-        group.end = result.end = performance.now();
-        group.pass = false;
-        this.pass = false;
-        group.reason = `Test suite ${group.name} failed in afterEach callback.`;
-        result.pass = false;
-        group.time = timeDifference(group.end, group.start);
-        this.reporter.onTestFinish(group, result);
-        this.reporter.onGroupFinish(group);
-        return;
-      }
-    }
+  private reportExpectedNull(negated: 1 | 0): void {
+    const value = new ActualValue();
+    value.message = `null`;
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    value.value = null;
+    this.expected = value;
   }
 
   /**
-   * Run the beforeEach callbacks before running the test.
+   * This function reports an actual numeric value.
    *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current test group.
-   * @param {TestResult} result - The current test result.
+   * @param {number} numericValue - The value to be expected.
    */
-  private runBeforeEach(group: TestGroup, result: TestResult): void {
-    // for each beforeEach callback function pointer
-    for (const beforeEachCallback of group.beforeEachPointers) {
-      const beforeEachResult = this.tryCall(beforeEachCallback);
-      // if beforeEach fails
-      if (beforeEachResult === 0) {
-        result.end = group.end = performance.now();
-        group.pass = false;
-        group.reason = group.reason = `Test suite ${group.name} failed in beforeEach callback.`;
-        result.pass = false;
-        group.time = timeDifference(group.end, group.start);
-        this.reporter.onTestFinish(group, result);
-        this.reporter.onGroupFinish(group);
-        this.endGroup = true;
-        return;
-      }
-    }
+  private reportActualValue(numericValue: number): void {
+    const value = new ActualValue();
+    value.message = numericValue.toString();
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.value = numericValue;
+    this.actual = value;
   }
 
   /**
-   * Run the afterAll callbacks with the given runContext and group.
+   * This function reports an expected numeric value.
    *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current test group.
+   * @param {number} numericValue - The value to be expected
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
    */
-  private runAfterAll(group: TestGroup): void {
-    for (const afterAllCallback of group.afterAllPointers) {
-      // call each afterAll callback
-      const afterAllResult = this.tryCall(afterAllCallback);
-      // if the test fails
-      if (afterAllResult === 0) {
-        group.end = performance.now();
-        group.pass = false;
-        group.reason = `Test suite ${group.name} failed in afterAll callback.`;
-        this.pass = false;
-        group.time = timeDifference(group.end, group.start);
-        this.reporter.onGroupFinish(group);
-        this.endGroup = true;
-        return;
-      }
-    }
+  private reportExpectedValue(numericValue: number, negated: 0 | 1): void {
+    const value = new ActualValue();
+    value.message = numericValue.toString();
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    value.value = numericValue;
+    this.expected = value;
+  }
+
+ /**
+  * This function reports an actual reference value.
+  *
+  * @param {number} referencePointer - The actual reference pointer.
+  * @param {number} offset - The size of the reference in bytes.
+  */
+ private reportActualReference(referencePointer: number, offset: number): void {
+   const value = new ActualValue();
+   value.message = "Reference Value";
+   value.stack = this.getLogStackTrace();
+   value.target = this.logTarget;
+   value.pointer = referencePointer;
+   value.offset = offset;
+   value.bytes = Array.from(this.wasm!.U8.slice(referencePointer, referencePointer + offset));
+   value.value = referencePointer;
+   this.actual = value;
+ }
+
+ /**
+  * This function reports an expected reference value.
+  *
+  * @param {number} referencePointer - The expected reference pointer.
+  * @param {number} offset - The size of the reference in bytes.
+  * @param {1 | 0} negated - An indicator if the expectation is negated.
+  */
+ private reportExpectedReference(referencePointer: number, offset: number, negated: 1 | 0): void {
+   const value = new ActualValue();
+   value.message = "Reference Value";
+   value.stack = this.getLogStackTrace();
+   value.target = this.logTarget;
+   value.pointer = referencePointer;
+   value.offset = offset;
+   value.bytes = Array.from(this.wasm!.U8.slice(referencePointer, referencePointer + offset));
+   value.negated = negated === 1;
+   value.value = referencePointer;
+   this.expected = value;
+ }
+
+  /**
+   * This function reports an expected truthy value.
+   *
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
+   */
+  private reportExpectedTruthy(negated: 1 | 0): void {
+    const value = new ActualValue();
+    value.message = "Truthy Value";
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    this.expected = value;
   }
 
   /**
-   * Run the beforeAll callbacks with the given runContext and group.
+   * This function reports an expected falsy value.
    *
-   * @param {RunContext} runContext - The current run context.
-   * @param {TestGroup} group - The current test group.
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
    */
-  private runBeforeAll(group: TestGroup): void {
-    for (const beforeAllCallback of group.beforeAllPointers) {
-      // call each beforeAll callback
-      const beforeAllResult = this.tryCall(beforeAllCallback);
-      // if the test fails
-      if (beforeAllResult === 0) {
-        group.end = performance.now();
-        group.pass = false;
-        group.reason = `Test suite ${group.name} failed in beforeAll callback.`;
-        this.pass = false;
-        group.time = timeDifference(group.end, group.start);
-        this.endGroup = true;
-        return;
-      }
+  private reportExpectedFalsy(negated: 1 | 0): void {
+    const value = new ActualValue();
+    value.message = "Falsy Value";
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    this.expected = value;
+  }
+
+  /**
+   * This function reports an expected finite value.
+   *
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
+   */
+  private reportExpectedFinite(negated: 1 | 0): void {
+    const value = new ActualValue();
+    value.message = "Finite Value";
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    this.expected = value;
+  }
+
+  /**
+   * This function reports an actual string value.
+   *
+   * @param {number} stringPointer - A pointer that points to the actual string.
+   */
+  private reportActualString(stringPointer: number): void {
+    const value = new ActualValue();
+    value.message = this.wasm!.__getString(stringPointer);
+    value.pointer = stringPointer;
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.value = stringPointer;
+    this.actual = value;
+  }
+
+  /**
+   * This function reports an expected string value.
+   *
+   * @param {number} stringPointer - A pointer that points to the expected string.
+   * @param {1 | 0} negated - An indicator if the expectation is negated.
+   */
+  private reportExpectedString(stringPointer: number, negated: 1 | 0): void {
+    const value = new ActualValue();
+    value.message = this.wasm!.__getString(stringPointer);
+    value.pointer = stringPointer;
+    value.stack = this.getLogStackTrace();
+    value.target = this.logTarget;
+    value.negated = negated === 1;
+    value.value = stringPointer;
+    this.expected = value;
+  }
+
+  /**
+   * This function overrides the provided AssemblyScript `env.abort()` function to catch abort
+   * reasons.
+   *
+   * @param {number} reasonPointer - This points to the message value that causes the expectation to
+   * fail.
+   * @param {number} _fileNamePointer - The file name that reported the error. (Ignored)
+   * @param {number} _line - The line that reported the error. (Ignored)
+   * @param {number} _col - The column that reported the error. (Ignored)
+   */
+  private abort(reasonPointer: number, _fileNamePointer: number, _line: number, _col: number): void {
+    this.logTarget.message = this.wasm!.__getString(reasonPointer);
+  }
+
+  /**
+   * Gets a log stack trace.
+   */
+  private getLogStackTrace(): string {
+    return new Error("Get stack trace.")
+      .stack!
+      .toString()
+      .split("\n")
+      .slice(1)
+      .filter(wasmFilter)
+      .join("\n");
+  }
+
+  /**
+   * Gets an error stack trace.
+   */
+  private getErrorStackTrace(ex: Error): string {
+    var stackItems = ex.stack!.toString().split("\n");
+    return [stackItems[0], ...stackItems.slice(1).filter(wasmFilter)].join("\n");
+  }
+
+  /**
+   * This is called to stop the debugger.  e.g. `node --inspect-brk asp`.
+   */
+  private debug(): void { debugger; }
+
+  /**
+   * This is a web assembly utility function that wraps a function call in a try catch block to
+   * report success or failure.
+   *
+   * @param {number} pointer - The function pointer to call. It must accept no parameters and return
+   * void.
+   * @returns {1 | 0} - If the callback was run successfully without error, it returns 1, else it
+   * returns 0.
+   */
+  protected tryCall(pointer: number): 1 | 0 {
+    if (pointer === -1) return 1;
+
+    try {
+      this.wasm!.__call(pointer)
+    } catch (ex){
+      this.logTarget.stack = this.getErrorStackTrace(ex);
+      return 0;
     }
+    return 1;
+  }
+
+  /**
+   * Log a null value to the reporter.
+   */
+  private logNull(): void {
+    // create a new log value
+    const value = new LogValue();
+    const target = this.logTarget;
+
+    // collect log metadata
+    value.stack = this.getLogStackTrace();
+    value.message = "null";
+    value.target = target;
+
+    // push the log value to the logs
+    target.logs.push(value);
+  }
+
+  /**
+   * This function is called after each expectation if the expectation passes. This prevents other
+   * unreachable() conditions that throw errors to report actual and expected values too.
+   */
+  private clearExpected(): void {
+    this.expected = null;
+    this.actual = null;
+    this.logTarget.stack = "";
+  }
+
+  /**
+   * Log a reference to the reporter.
+   *
+   * @param {number} referencePointer - The pointer to the reference.
+   * @param {number} offset - The offset of the reference.
+   */
+  private logReference(referencePointer: number, offset: number): void {
+    const value = new LogValue();
+    const target = this.logTarget;
+
+    value.bytes = Array.from(this.wasm!.U8.slice(referencePointer, referencePointer + offset));
+    value.message = "Reference Type";
+    value.offset = offset;
+    value.pointer = referencePointer;
+    value.stack = this.getLogStackTrace();
+    value.target = target;
+    value.value = referencePointer;
+
+    // push the log value to the logs
+    target.logs.push(value);
+  }
+
+  /**
+   * This adds a logged string to the current test.
+   *
+   * @param {number} pointer - The pointer to the logged string reference.
+   */
+  private logString(pointer: number): void {
+    const value = new LogValue();
+    const target = this.logTarget;
+
+    value.message = this.wasm!.__getString(pointer);
+    value.offset = 0;
+    value.pointer = pointer;
+    value.stack = this.getLogStackTrace();
+    value.target = target;
+    value.value = pointer;
+
+    // push the log value to the logs
+    target.logs.push(value);
+  }
+
+  /**
+   * Log a numevalueric value to the reporter.
+   *
+   * @param {number} value - The value to be logged.
+   */
+  private logValue(numericValue: number): void {
+    const value = new LogValue();
+    const target = this.logTarget;
+
+    value.stack = this.getLogStackTrace();
+    value.message = `Value ${numericValue.toString()}`;
+    value.value = numericValue;
+    value.target = target;
+
+    // push the log value to the logs
+    target.logs.push(value);
   }
 }
